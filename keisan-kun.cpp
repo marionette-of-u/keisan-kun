@@ -2,6 +2,7 @@
 #include <netdb.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <signal.h>
 
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -19,9 +20,54 @@
 #include <string>
 #include <map>
 
-char pipebuf[0xF00];
+#define R 0
+#define W 1
+
+char pipebuf[0x1000];
+
+int popen2(const char *command, int *pfd){
+  int pipe_c2p[2], pipe_p2c[2];
+  pid_t pid;
+
+  if(pipe(pipe_c2p) < 0){
+    perror("popen2");
+    return -1;
+  }
+
+  if(pipe(pipe_p2c) < 0){
+    perror("popen2");
+    close(pipe_c2p[R]), close(pipe_c2p[W]);
+    return -1;
+  }
+
+  if((pid = fork()) < 0){
+    perror("popen2");
+    close(pipe_c2p[R]), close(pipe_c2p[W]);
+    close(pipe_p2c[R]), close(pipe_p2c[W]);
+    return -1;
+  }
+
+  if(pid == 0){
+    close(pipe_p2c[W]), close(pipe_c2p[R]);
+    dup2(pipe_p2c[R], STDIN_FILENO);
+    dup2(pipe_c2p[W], STDOUT_FILENO);
+    close(pipe_p2c[R]), close(pipe_c2p[W]);
+    if(execlp("sh", "sh", "-c", command, NULL) < 0){
+      perror("popen2");
+      close(pipe_p2c[R]), close(pipe_c2p[W]);
+      exit(-1);
+    }
+  }
+
+  close(pipe_p2c[R]), close(pipe_c2p[W]);
+  pfd[R] = pipe_c2p[R];
+  pfd[W] = pipe_p2c[W];
+
+  return pid;
+}
 
 const char
+  *wolfram_command = "wolfram",
   *bot_owner = "bot_owner:uwanosora",
   *nick = "keisan-kun",
   *serv = "irc.livedoor.ne.jp",
@@ -29,34 +75,38 @@ const char
 
 unsigned char chname[20];
 
-size_t w(std::string name, std::string command){
-  using namespace std;
-  {
-    ofstream ofile("redirect", ios::trunc);
-    ofile << command << endl;
-  }
+struct session{
+  int fd[2];
+};
 
-  FILE *fp = popen("wolfram < redirect", "r");
+typedef std::map<std::string, session> session_map_type;
+session_map_type session_map;
 
+size_t read_line(int rfd, char terminal_symbol = '\n'){
   size_t i;
   char c;
-  for(int n = 0; n < 6; ++n){
-    i = 0;
-    do{
-      if(i > sizeof(pipebuf)){
-        sprintf(pipebuf, ">_<\n");
-        i = 4;
-        break;
-      }
-      fread((void*)&c, 1, 1, fp);
-      pipebuf[i++] = c;
-    }while(c != '\n');
-  }
+  i = 0;
+  do{
+    if(i > sizeof(pipebuf)){
+      sprintf(pipebuf, ">_<\n");
+      i = 4;
+      break;
+    }
+    read(rfd, (void*)&c, 1);
+    pipebuf[i++] = c;
+  }while(c != terminal_symbol);
   pipebuf[i] = '\0';
-
-  pclose(fp);
-
+  printf(pipebuf);
   return i;
+}
+
+int pfd[2];
+
+size_t w2(std::string name, std::string command){
+  read_line(pfd[R], '=');
+  write(pfd[W], command.c_str(), command.size());
+  read_line(pfd[R], '\n');
+  return read_line(pfd[R], '\n');
 }
 
 int main(int argc, char *argv[]) {
@@ -88,7 +138,7 @@ int main(int argc, char *argv[]) {
   sprintf(msgbuf, "PRIVMSG");
 
   int ret;
-  char buf[512];
+  char buf[0x800];
   int sock;
   struct addrinfo hints, *ai;
   memset(&hints, 0, sizeof(struct addrinfo));
@@ -106,11 +156,17 @@ int main(int argc, char *argv[]) {
   }
   freeaddrinfo(ai);
   sprintf(buf, "USER %s 0 * :%s\r\n", nick, bot_owner);
+  printf(buf), printf("\n");
   send(sock, buf, strlen(buf), 0);
   sprintf(buf, "NICK %s\r\n", nick);
+  printf(buf), printf("\n");
   send(sock, buf, strlen(buf), 0);
-  while (recv(sock, buf, 512, 0) > 0) {
-    fputs(buf, stdout);
+
+  popen2(wolfram_command, pfd);
+  for(int i = 0; i < 4; ++i){ read_line(pfd[R]); }
+
+  while (recv(sock, buf, sizeof(buf), 0) > 0) {
+    //fputs(buf, stdout);
     if (!strncmp(buf, "PING ", 5)) {
       buf[1] = 'O';
       send(sock, buf, strlen(buf), 0);
@@ -127,37 +183,17 @@ int main(int argc, char *argv[]) {
     string msg_str(first_space, strchr(buf, '\n'));
     size_t idx = msg_str.find(" :w ");
     if (idx == -1) { continue; }
-    idx++, idx++, idx++, idx++;
-    size_t n = w("", msg_str.substr(idx, msg_str.size() - idx));
+    idx += 4;
+    size_t n = w2("", msg_str.substr(idx, msg_str.size() - idx));
     if (n > 0) {
       string output;
       output += "NOTICE ";
       output += chan;
       output += " :";
-      output += &pipebuf[8];
+      output += pipebuf;
       output += "\r\n";
       send(sock, output.c_str(), output.size(), 0);
     }
-//    if (!strncmp(first_space + 1, msgbuf, strlen(msgbuf))) {
-//      string(first_space).find(" :w ");
-//      const char
-//        *command = strchr(buf + strlen(msgbuf) + 1, ':') + 1,
-//        *name_begin = strchr(command + 1, ':') + 1,
-//        *name_end = strchr(name_begin + 1, ' ');
-//      if (strncmp(command, "w ", 2)) continue;
-//      command = command + 2;
-//      size_t n = w("", string(command, strchr(command + 1, '\n') - 1));
-//      if (n > 0) {
-//        std::string output;
-//        output += "NOTICE ";
-//        output += chan;
-//        output += " :";
-//        output += &pipebuf[8];
-//        output += "\r\n";
-//        send(sock, output.c_str(), output.size(), 0);
-//      }
-//      continue;
-//    }
   }
   close(sock);
   return 0;
