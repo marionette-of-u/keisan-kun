@@ -123,16 +123,17 @@ private:
   };
 
 public:
-  class iostream : public std::basic_iostream<char, std::char_traits<char>>{
-    iostream() = delete;
-    iostream(const iostream&) = delete;
-    iostream(iostream&&) = delete;
+  class stream : public std::basic_iostream<char, std::char_traits<char>>{
+  public:
+    stream() = delete;
+    stream(const stream&) = delete;
+    stream(stream&&) = delete;
 
-    iostream(int s, char *read_buffer, char *write_buffer) :
+    stream(int s, char *read_buffer, char *write_buffer) :
       std::basic_iostream<char, std::char_traits<char>>(new server_stream(s, read_buffer, write_buffer))
     {}
 
-    ~iostream(){}
+    ~stream(){}
   };
 
   http_server(){
@@ -165,8 +166,7 @@ public:
     close(listening_socket);
   }
 
-  virtual void receive(iostream&) = 0;
-  virtual void send(iostream&) = 0;
+  virtual bool proc(stream&) = 0;
 
   void run(){
     while(true){
@@ -193,10 +193,10 @@ public:
           int new_socket = accept_new_client();
           if(new_socket != -1){ FD_SET(new_socket, &org_target_fds); }
         }else{
-	  iostream ios(item.first, item.second.read_buffer, item.second.write_buffer);
-	  receive(ios);
-	  send(ios);
-	  FD_CLR(item.first, &org_target_fds);
+	  stream ios(item.first, item.second.read_buffer, item.second.write_buffer);
+	  if(!proc(ios)){
+	    FD_CLR(item.first, &org_target_fds);
+	  }
 	  time(&item.second.last_access);
         }
       }
@@ -341,7 +341,21 @@ http_client<> &operator >>(http_client<> &i, std::string &str){
 
 #include <iostream>
 
+struct echo_server : public keisan_kun::http_server<>{
+  using base_type = keisan_kun::http_server<>;
+  bool proc(stream &s){
+    std::string str;
+    s >> str;
+    s << str;
+    return false;
+  }
+};
+
 int main(){
+  echo_server server;
+  server.run();
+
+  /*
   keisan_kun::http_client<> http_client("http://www.google.co.jp/");
   std::string str;
 
@@ -349,5 +363,6 @@ int main(){
   while(http_client >> str){
     std::cout << str;
   }
+  */
   return 0;
 } 
