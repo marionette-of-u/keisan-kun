@@ -8,7 +8,10 @@
 #include <sys/param.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 
+#include <map>
+#include <vector>
 #include <algorithm>
 #include <memory>
 #include <string>
@@ -18,17 +21,229 @@
 #include <iostream>
 
 namespace keisan_kun{
+template<class TemplateTag = void>
+class http_server{
+public:
+  class exception : public std::runtime_error{
+  public:
+    exception() : std::runtime_error("http_server"){}
+    exception(const std::string &message) : std::runtime_error("http_server: " + message){}
+  };
+
+  static const std::size_t buffer_size = 0x100;
+  static const std::size_t timeout = 3;
+
+private:
+  struct client_info{
+    client_info() = default;
+    client_info(const client_info&) = delete;
+
+    client_info(client_info &&other) :
+      hostname(std::move(other.hostname)),
+      ipaddr(std::move(other.ipaddr)),
+      port(std::move(other.port)),
+      last_access(std::move(other.last_access)),
+      read_buffer(other.read_buffer),
+      write_buffer(other.write_buffer)
+    {
+      read_buffer = nullptr;
+      write_buffer = nullptr;
+    }
+
+    ~client_info(){
+      delete[] read_buffer;
+      delete[] write_buffer;
+    }
+
+    std::string hostname, ipaddr;
+    int port;
+    time_t last_access;
+    char
+      *read_buffer = new char[buffer_size],
+      *write_buffer = new char[buffer_size];
+  };
+
+  class server_stream : public std::basic_streambuf<char, std::char_traits<char>>{
+  public:
+    server_stream(int s, char *read_buffer, char *write_buffer) :
+      std::basic_streambuf<char, std::char_traits<char>>(),
+      s(s),
+      read_buffer(read_buffer),
+      write_buffer(write_buffer)
+    {}
+
+    server_stream() = default;
+    server_stream(const server_stream&) = default;
+    server_stream(server_stream&&) = default;
+
+    ~server_stream(){}
+
+  protected:
+    std::streampos seekoff(std::streamoff,  std::ios::seek_dir, int = std::ios::in | std::ios::out){
+      return std::char_traits<char>::eof();
+    }
+
+    std::streampos seekpos(std::streampos, int = std::ios::in | std::ios::out){
+      return std::char_traits<char>::eof();
+    }
+
+    int overflow(char c = std::char_traits<char>::eof()){
+      if(c != std::char_traits<char>::eof()){
+	write_buffer[w_current++] = c;
+	if(w_current >= buffer_size){
+	  w_current = 0;
+	  ::write(s, write_buffer, buffer_size);
+	}
+      }else if(w_current > 0){
+	::write(s, write_buffer, buffer_size);
+	w_current = 0;
+      }
+      return 0;
+    }
+
+    int underflow(){
+      if(r_current > 0){
+	return read_buffer[r_size - r_current--];
+      }else{
+	if(r_size > 0){
+	  int ret = read_buffer[r_size - 1];
+	  r_size = ::read(s, read_buffer, buffer_size);
+	  r_current = 0;
+	  return ret;
+	}else{
+	  return std::char_traits<char>::eof();
+	}
+      }
+    }
+
+  private:
+    int s;
+    char *read_buffer, *write_buffer;
+    std::size_t r_current = 0, r_size = 0, w_current = 0;
+  };
+
+public:
+  class iostream : public std::basic_iostream<char, std::char_traits<char>>{
+    iostream() = delete;
+    iostream(const iostream&) = delete;
+    iostream(iostream&&) = delete;
+
+    iostream(int s, char *read_buffer, char *write_buffer) :
+      std::basic_iostream<char, std::char_traits<char>>(new server_stream(s, read_buffer, write_buffer))
+    {}
+
+    ~iostream(){}
+  };
+
+  http_server(){
+    int sock_optval = 1;
+    listening_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if(setsockopt(listening_socket, SOL_SOCKET, SO_REUSEADDR, &sock_optval, sizeof(sock_optval)) == -1){
+      throw(exception("setsockopt"));
+    }
+
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(port);
+    sin.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if(bind(listening_socket, (sockaddr*)&sin, sizeof(sin)) < 0){
+      throw(exception("bind"));
+    }
+
+    if(listen(listening_socket, SOMAXCONN) == -1){
+      throw(exception("listen"));
+    }
+
+    FD_ZERO(&org_target_fds);
+    FD_SET(listening_socket, &org_target_fds);
+  }
+
+  http_server(const http_server&) = delete;
+  http_server(http_server&&) = delete;
+
+  ~http_server(){
+    close(listening_socket);
+  }
+
+  virtual void receive(iostream&) = 0;
+  virtual void send(iostream&) = 0;
+
+  void run(){
+    while(true){
+      timeval waitval;
+      waitval.tv_sec = 2;
+      waitval.tv_usec = 500;
+
+      target_fds = org_target_fds;
+      select(FD_SETSIZE, &target_fds, nullptr, nullptr, &waitval);
+
+      for(auto iter = client_info_map.begin(); iter != client_info_map.end(); ++iter){
+        std::pair<const int, client_info> &item(*iter);
+
+        time_t now_time;
+        time(&now_time);
+        if(now_time - timeout > item.second.last_access){
+          close(item.first);
+          FD_CLR(item.first, &org_target_fds);
+          iter = client_info_map.erase(iter);
+          continue;
+        }
+
+        if(item.first == listening_socket){
+          int new_socket = accept_new_client();
+          if(new_socket != -1){ FD_SET(new_socket, &org_target_fds); }
+        }else{
+	  iostream ios(item.first, item.second.read_buffer, item.second.write_buffer);
+	  receive(ios);
+	  send(ios);
+	  FD_CLR(item.first, &org_target_fds);
+	  time(&item.second.last_access);
+        }
+      }
+    }
+  }
+
+private:
+  int accept_new_client(){
+    int len = sizeof(sin);
+    int new_socket = accept(listening_socket, (sockaddr*)&sin, (socklen_t*)&len);
+    if(new_socket == -1){
+      throw(exception("accept"));
+    }
+    hostent *peer_host;
+    sockaddr_in peer_sin;
+    len = sizeof(peer_sin);
+    getpeername(new_socket, (sockaddr*)&peer_sin, (socklen_t*)&len);
+    peer_host = gethostbyaddr((char*)&peer_sin.sin_addr.s_addr, sizeof(peer_sin.sin_addr), AF_INET);
+
+    client_info info;
+    info.hostname = peer_host->h_name;
+    info.ipaddr = inet_ntoa(peer_sin.sin_addr);
+    info.port = ntohs(peer_sin.sin_port);
+    time(&info.last_access);
+    client_info_map.insert(std::make_pair(new_socket, std::move(info)));
+
+    return new_socket;
+  }
+
+  std::map<int, client_info> client_info_map;
+  int listening_socket, port;
+  sockaddr_in sin;
+  fd_set org_target_fds, target_fds;
+};
+
+template<class TemplateTag = void>
 class http_client{
-  friend http_client &operator >>(http_client &i, std::string &str);
+  friend http_client<> &operator >>(http_client<> &i, std::string &str);
 
 public:
   class exception : public std::runtime_error{
   public:
     exception() : std::runtime_error("http_client"){}
-    exception(const std::string &message) : std::runtime_error(message){}
+    exception(const std::string &message) : std::runtime_error("http_client: " + message){}
   };
 
-  const std::size_t buffer_size = 0x800;
+  static const std::size_t buffer_size = 0x800;
 
   http_client() = delete;
   http_client(const http_client&) = delete;
@@ -38,7 +253,7 @@ public:
     return received_size > 0;
   }
 
-  http_client(std::string str){
+  http_client(std::string str) : buffer(new char[buffer_size]){
     if(!strstr(str.c_str(), "http://")){ throw(exception("address")); }
     std::string host_path = str.substr(7, str.size() - 7);
     if(host_path.size() == 0){ throw(exception("address")); }
@@ -68,9 +283,9 @@ public:
     }else{
       service = getservbyname("http", "tcp");
       if(service){
-	server.sin_port = service->s_port;
+        server.sin_port = service->s_port;
       }else{
-	server.sin_port = htons(80);
+        server.sin_port = htons(80);
       }
     }
 
@@ -103,7 +318,7 @@ public:
 
 private:
   void receive_once(){
-    received_size = fread((void*)buffer, sizeof(buffer_size), 1, fp);
+    received_size = fread((void*)buffer.get(), sizeof(buffer_size), 1, fp);
   }
 
   int s; // file discriptor.
@@ -111,15 +326,15 @@ private:
   servent *service;
   sockaddr_in server = { 0 }; // for socket.
   FILE *fp;
-  char *buffer = new char[buffer_size];
+  std::unique_ptr<char> buffer;
   std::size_t received_size = 0;
   std::string host, path;
-  unsigned port = 80;  
+  unsigned port = 80;
 };
 
-http_client &operator >>(http_client &i, std::string &str){
+http_client<> &operator >>(http_client<> &i, std::string &str){
   i.receive_once();
-  str = std::string(&i.buffer[0], &i.buffer[i.received_size]);
+  str = std::string(i.buffer.get(), i.buffer.get() + i.received_size);
   return i;
 }
 } // namespace keisan_kun
@@ -127,7 +342,7 @@ http_client &operator >>(http_client &i, std::string &str){
 #include <iostream>
 
 int main(){
-  keisan_kun::http_client http_client("http://www.google.co.jp/");
+  keisan_kun::http_client<> http_client("http://www.google.co.jp/");
   std::string str;
 
   http_client.start_receive();
