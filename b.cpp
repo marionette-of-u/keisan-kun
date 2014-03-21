@@ -19,6 +19,8 @@
 #include <stdexcept>
 #include <iterator>
 #include <iostream>
+#include <thread>
+#include <atomic>
 
 namespace keisan_kun{
 template<class TemplateTag = void>
@@ -89,30 +91,30 @@ private:
 
     int overflow(char c = std::char_traits<char>::eof()){
       if(c != std::char_traits<char>::eof()){
-	write_buffer[w_current++] = c;
-	if(w_current >= buffer_size){
-	  w_current = 0;
-	  ::write(s, write_buffer, buffer_size);
-	}
+        write_buffer[w_current++] = c;
+        if(w_current >= buffer_size){
+          w_current = 0;
+          ::write(s, write_buffer, buffer_size);
+        }
       }else if(w_current > 0){
-	::write(s, write_buffer, buffer_size);
-	w_current = 0;
+        ::write(s, write_buffer, buffer_size);
+        w_current = 0;
       }
       return 0;
     }
 
     int underflow(){
       if(r_current > 0){
-	return read_buffer[r_size - r_current--];
+        return read_buffer[r_size - r_current--];
       }else{
-	if(r_size > 0){
-	  int ret = read_buffer[r_size - 1];
-	  r_size = ::read(s, read_buffer, buffer_size);
-	  r_current = 0;
-	  return ret;
-	}else{
-	  return std::char_traits<char>::eof();
-	}
+        if(r_size > 0){
+          int ret = read_buffer[r_size - 1];
+          r_size = ::read(s, read_buffer, buffer_size);
+          r_current = 0;
+          return ret;
+        }else{
+          return std::char_traits<char>::eof();
+        }
       }
     }
 
@@ -136,7 +138,7 @@ public:
     ~stream(){}
   };
 
-  http_server(){
+  http_server() : alive(true){
     int sock_optval = 1;
     listening_socket = socket(AF_INET, SOCK_STREAM, 0);
     if(setsockopt(listening_socket, SOL_SOCKET, SO_REUSEADDR, &sock_optval, sizeof(sock_optval)) == -1){
@@ -163,44 +165,61 @@ public:
   http_server(http_server&&) = delete;
 
   ~http_server(){
+    alive = false;
     close(listening_socket);
   }
 
   virtual bool proc(stream&) = 0;
 
-  void run(){
-    while(true){
+  void launch(){
+    auto f = [&](){
       timeval waitval;
       waitval.tv_sec = 2;
       waitval.tv_usec = 500;
 
-      target_fds = org_target_fds;
-      select(FD_SETSIZE, &target_fds, nullptr, nullptr, &waitval);
+      while(true){
+    if(!std::atomic_load_explicit(&alive, std::memory_order_seq_cst)){
+      return;
+    }
 
-      for(auto iter = client_info_map.begin(); iter != client_info_map.end(); ++iter){
-        std::pair<const int, client_info> &item(*iter);
+    target_fds = org_target_fds;
+        select(FD_SETSIZE, &target_fds, nullptr, nullptr, &waitval);
 
-        time_t now_time;
-        time(&now_time);
-        if(now_time - timeout > item.second.last_access){
-          close(item.first);
-          FD_CLR(item.first, &org_target_fds);
-          iter = client_info_map.erase(iter);
-          continue;
-        }
+        for(auto iter = client_info_map.begin(); iter != client_info_map.end(); ++iter){
+          std::pair<const int, client_info> &item(*iter);
 
-        if(item.first == listening_socket){
-          int new_socket = accept_new_client();
-          if(new_socket != -1){ FD_SET(new_socket, &org_target_fds); }
-        }else{
-	  stream ios(item.first, item.second.read_buffer, item.second.write_buffer);
-	  if(!proc(ios)){
-	    FD_CLR(item.first, &org_target_fds);
-	  }
-	  time(&item.second.last_access);
+          time_t now_time;
+          time(&now_time);
+          if(now_time - timeout > item.second.last_access){
+            close(item.first);
+            FD_CLR(item.first, &org_target_fds);
+            iter = client_info_map.erase(iter);
+            continue;
+          }
+
+          if(item.first == listening_socket){
+            int new_socket = accept_new_client();
+            if(new_socket != -1){ FD_SET(new_socket, &org_target_fds); }
+          }else{
+            stream s(item.first, item.second.read_buffer, item.second.write_buffer);
+            if(!proc(s)){
+              FD_CLR(item.first, &org_target_fds);
+              iter = client_info_map.erase(iter);
+              continue;
+            }
+
+            time(&item.second.last_access);
+          }
         }
       }
-    }
+    };
+
+    thread_ptr.reset(new std::thread(f));
+    thread_ptr->detach();
+  }
+
+  void halt(){
+    alive = false;
   }
 
 private:
@@ -230,6 +249,8 @@ private:
   int listening_socket, port;
   sockaddr_in sin;
   fd_set org_target_fds, target_fds;
+  std::unique_ptr<std::thread> thread_ptr;
+  std::atomic<bool> alive;
 };
 
 template<class TemplateTag = void>
@@ -342,7 +363,6 @@ http_client<> &operator >>(http_client<> &i, std::string &str){
 #include <iostream>
 
 struct echo_server : public keisan_kun::http_server<>{
-  using base_type = keisan_kun::http_server<>;
   bool proc(stream &s){
     std::string str;
     s >> str;
@@ -353,7 +373,9 @@ struct echo_server : public keisan_kun::http_server<>{
 
 int main(){
   echo_server server;
-  server.run();
+  server.launch();
+  std::cout << "server.launch();\nsleep(3);" << std::endl;
+  sleep(3);
 
   /*
   keisan_kun::http_client<> http_client("http://www.google.co.jp/");
