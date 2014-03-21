@@ -35,7 +35,7 @@ public:
 
 private:
   struct client_info{
-    client_info() = default;
+    client_info(int port = 80) : port(port){}
     client_info(const client_info&) = delete;
 
     client_info(client_info &&other) :
