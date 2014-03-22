@@ -34,6 +34,7 @@ public:
 
   static const std::size_t buffer_size = 0x100;
   static const std::size_t timeout = 3;
+  static const std::size_t max_socket_num = FD_SETSIZE / 8;
 
 private:
   struct client_info{
@@ -138,7 +139,11 @@ public:
     ~stream(){}
   };
 
-  http_server() : alive(true){
+  http_server(int port) : client_info_map(new client_info[max_socket_num]), port(port), alive(true){
+    for(int i = 0; i < max_socket_num; ++i){
+      client_info_map[i].port = port;
+    }
+
     int sock_optval = 1;
     listening_socket = socket(AF_INET, SOCK_STREAM, 0);
     if(setsockopt(listening_socket, SOL_SOCKET, SO_REUSEADDR, &sock_optval, sizeof(sock_optval)) == -1){
@@ -161,6 +166,7 @@ public:
     FD_SET(listening_socket, &org_target_fds);
   }
 
+  http_server() = delete;
   http_server(const http_server&) = delete;
   http_server(http_server&&) = delete;
 
@@ -173,44 +179,43 @@ public:
 
   void launch(){
     auto f = [&](){
-      timeval waitval;
-      waitval.tv_sec = 2;
-      waitval.tv_usec = 500;
+      try{
+        timeval waitval;
+        waitval.tv_sec = 2;
+        waitval.tv_usec = 500;
 
-      while(true){
-    if(!std::atomic_load_explicit(&alive, std::memory_order_seq_cst)){
-      return;
-    }
-
-    target_fds = org_target_fds;
-        select(FD_SETSIZE, &target_fds, nullptr, nullptr, &waitval);
-
-        for(auto iter = client_info_map.begin(); iter != client_info_map.end(); ++iter){
-          std::pair<const int, client_info> &item(*iter);
-
-          time_t now_time;
-          time(&now_time);
-          if(now_time - timeout > item.second.last_access){
-            close(item.first);
-            FD_CLR(item.first, &org_target_fds);
-            iter = client_info_map.erase(iter);
-            continue;
+        while(true){
+          if(!std::atomic_load_explicit(&alive, std::memory_order_seq_cst)){
+            return;
           }
 
-          if(item.first == listening_socket){
-            int new_socket = accept_new_client();
-            if(new_socket != -1){ FD_SET(new_socket, &org_target_fds); }
-          }else{
-            stream s(item.first, item.second.read_buffer, item.second.write_buffer);
-            if(!proc(s)){
-              FD_CLR(item.first, &org_target_fds);
-              iter = client_info_map.erase(iter);
-              continue;
+          target_fds = org_target_fds;
+          select(max_socket_num, &target_fds, nullptr, nullptr, &waitval);
+          for(int i = 0; i < max_socket_num; ++i){
+            if(!FD_ISSET(i, &org_target_fds)){ continue; }
+            if(i != listening_socket){
+              time_t now_time;
+              time(&now_time);
+              if(now_time - timeout > client_info_map[i].last_access){
+                close(i);
+                FD_CLR(i, &org_target_fds);
+                continue;
+              }
+              time(&client_info_map[i].last_access);
+              stream s(i, client_info_map[i].read_buffer, client_info_map[i].write_buffer);
+              if(!proc(s)){
+                FD_CLR(i, &org_target_fds);
+              }
+            }else{
+              int new_socket = accept_new_client();
+              if(new_socket != -1){
+                FD_SET(new_socket, &org_target_fds);
+              }
             }
-
-            time(&item.second.last_access);
           }
         }
+      }catch(...){
+        std::cerr << "error" << std::endl;
       }
     };
 
@@ -224,8 +229,9 @@ public:
 
 private:
   int accept_new_client(){
+    int new_socket = 0;
     int len = sizeof(sin);
-    int new_socket = accept(listening_socket, (sockaddr*)&sin, (socklen_t*)&len);
+    new_socket = accept(listening_socket, (sockaddr*)&sin, (socklen_t*)&len);
     if(new_socket == -1){
       throw(exception("accept"));
     }
@@ -235,17 +241,16 @@ private:
     getpeername(new_socket, (sockaddr*)&peer_sin, (socklen_t*)&len);
     peer_host = gethostbyaddr((char*)&peer_sin.sin_addr.s_addr, sizeof(peer_sin.sin_addr), AF_INET);
 
-    client_info info;
+    client_info &info(client_info_map[new_socket]);
     info.hostname = peer_host->h_name;
     info.ipaddr = inet_ntoa(peer_sin.sin_addr);
     info.port = ntohs(peer_sin.sin_port);
     time(&info.last_access);
-    client_info_map.insert(std::make_pair(new_socket, std::move(info)));
 
     return new_socket;
   }
 
-  std::map<int, client_info> client_info_map;
+  std::unique_ptr<client_info[]> client_info_map;
   int listening_socket, port;
   sockaddr_in sin;
   fd_set org_target_fds, target_fds;
@@ -363,19 +368,25 @@ http_client<> &operator >>(http_client<> &i, std::string &str){
 #include <iostream>
 
 struct echo_server : public keisan_kun::http_server<>{
+  echo_server(int port) : keisan_kun::http_server<>(port){}
+
   bool proc(stream &s){
+    std::cout << "Hello..." << std::endl;
     std::string str;
     s >> str;
-    s << str;
+    std::cout << str << std::endl;
+    std::cout << "close..." << std::endl;
     return false;
   }
 };
 
 int main(){
-  echo_server server;
+  echo_server server(11614);
   server.launch();
-  std::cout << "server.launch();\nsleep(3);" << std::endl;
-  sleep(3);
+  std::cout << "ready..." << std::endl;
+  while(true){
+    sleep(1);
+  }
 
   /*
   keisan_kun::http_client<> http_client("http://www.google.co.jp/");
