@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <iterator>
 #include <iostream>
+#include <streambuf>
 #include <thread>
 #include <atomic>
 
@@ -66,78 +67,31 @@ private:
       *write_buffer = new char[buffer_size];
   };
 
-  class server_stream : public std::basic_streambuf<char, std::char_traits<char>>{
+public:
+  class server_stream{
   public:
     server_stream(int s, char *read_buffer, char *write_buffer) :
-      std::basic_streambuf<char, std::char_traits<char>>(),
       s(s),
       read_buffer(read_buffer),
       write_buffer(write_buffer)
     {}
 
-    server_stream() = default;
+    server_stream() = delete;
     server_stream(const server_stream&) = default;
     server_stream(server_stream&&) = default;
+    ~server_stream() = default;
 
-    ~server_stream(){}
-
-  protected:
-    std::streampos seekoff(std::streamoff,  std::ios::seek_dir, int = std::ios::in | std::ios::out){
-      return std::char_traits<char>::eof();
-    }
-
-    std::streampos seekpos(std::streampos, int = std::ios::in | std::ios::out){
-      return std::char_traits<char>::eof();
-    }
-
-    int overflow(char c = std::char_traits<char>::eof()){
-      if(c != std::char_traits<char>::eof()){
-        write_buffer[w_current++] = c;
-        if(w_current >= buffer_size){
-          w_current = 0;
-          ::write(s, write_buffer, buffer_size);
-        }
-      }else if(w_current > 0){
-        ::write(s, write_buffer, buffer_size);
-        w_current = 0;
-      }
-      return 0;
-    }
-
-    int underflow(){
-      if(r_current > 0){
-        return read_buffer[r_size - r_current--];
-      }else{
-        if(r_size > 0){
-          int ret = read_buffer[r_size - 1];
-          r_size = ::read(s, read_buffer, buffer_size);
-          r_current = 0;
-          return ret;
-        }else{
-          return std::char_traits<char>::eof();
-        }
-      }
-    }
-
-  private:
     int s;
     char *read_buffer, *write_buffer;
-    std::size_t r_current = 0, r_size = 0, w_current = 0;
+    std::size_t r_current = 0, r_size, w_current = 0;
+    bool success;
   };
 
-public:
-  class stream : public std::basic_iostream<char, std::char_traits<char>>{
-  public:
-    stream() = delete;
-    stream(const stream&) = delete;
-    stream(stream&&) = delete;
+  template<class RHS>
+  friend server_stream &operator >>(server_stream&, RHS&);
 
-    stream(int s, char *read_buffer, char *write_buffer) :
-      std::basic_iostream<char, std::char_traits<char>>(new server_stream(s, read_buffer, write_buffer))
-    {}
-
-    ~stream(){}
-  };
+  template<class RHS>
+  friend server_stream &operator <<(server_stream&, const RHS&);
 
   http_server(int port) : client_info_map(new client_info[max_socket_num]), port(port), alive(true){
     for(int i = 0; i < max_socket_num; ++i){
@@ -175,7 +129,7 @@ public:
     close(listening_socket);
   }
 
-  virtual bool proc(stream&) = 0;
+  virtual bool proc(server_stream&) = 0;
 
   void launch(){
     auto f = [&](){
@@ -202,7 +156,7 @@ public:
                 continue;
               }
               time(&client_info_map[i].last_access);
-              stream s(i, client_info_map[i].read_buffer, client_info_map[i].write_buffer);
+              server_stream s(i, client_info_map[i].read_buffer, client_info_map[i].write_buffer);
               if(!proc(s)){
                 FD_CLR(i, &org_target_fds);
               }
@@ -257,6 +211,25 @@ private:
   std::unique_ptr<std::thread> thread_ptr;
   std::atomic<bool> alive;
 };
+
+template<class RHS>
+http_server<>::server_stream &operator >>(http_server<>::server_stream &s, RHS &rhs){
+  while(true){
+    int n = read(s.s, s.read_buffer, http_server<>::buffer_size);
+    std::cout << n << std::endl;
+    char c;
+    for(int i = 0; i < n; ++i){
+      rhs.push_back(s.read_buffer[i]);
+    }
+    if(n != http_server<>::buffer_size){ break; }
+  }
+  return s;
+}
+
+template<class RHS>
+http_server<>::server_stream &operator <<(http_server<>::server_stream &s, const RHS &rhs){
+  return s;
+}
 
 template<class TemplateTag = void>
 class http_client{
@@ -370,12 +343,10 @@ http_client<> &operator >>(http_client<> &i, std::string &str){
 struct echo_server : public keisan_kun::http_server<>{
   echo_server(int port) : keisan_kun::http_server<>(port){}
 
-  bool proc(stream &s){
-    std::cout << "Hello..." << std::endl;
+  bool proc(server_stream &s){
     std::string str;
     s >> str;
     std::cout << str << std::endl;
-    std::cout << "close..." << std::endl;
     return false;
   }
 };
