@@ -181,6 +181,10 @@ public:
     alive = false;
   }
 
+  bool now_running() const{
+    return static_cast<bool>(alive);
+  }
+
 private:
   int accept_new_client(){
     int new_socket = 0;
@@ -228,7 +232,19 @@ http_server<>::server_stream &operator >>(http_server<>::server_stream &s, RHS &
 
 template<class RHS>
 http_server<>::server_stream &operator <<(http_server<>::server_stream &s, const RHS &rhs){
+  auto iter = rhs.begin(), end = rhs.end();
+  while(iter != end){
+    int n;
+    for(n = 0; n < static_cast<int>(http_server<>::buffer_size) && iter != end; ++n, ++iter){
+      s.write_buffer[n] = *iter;
+    }
+    write(s.s, s.write_buffer, n);
+  }
   return s;
+}
+
+http_server<>::server_stream &operator <<(http_server<>::server_stream &s, const char *str){
+  return s << std::string(str);
 }
 
 template<class TemplateTag = void>
@@ -352,10 +368,10 @@ struct echo_server : public keisan_kun::http_server<>{
 };
 
 int main(){
-  echo_server server(11614);
+  echo_server server(55555);
   server.launch();
   std::cout << "ready..." << std::endl;
-  while(true){
+  while(server.now_running()){
     sleep(1);
   }
 
